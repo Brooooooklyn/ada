@@ -10,6 +10,12 @@ pub enum SchemeType {
     NotSpecial,
 }
 
+impl SchemeType {
+    pub fn is_special(&self) -> bool {
+        matches!(self, Self::Http | Self::Https | Self::File | Self::Ftp | Self::Ws | Self::Wss)
+    }
+}
+
 // Define public enum HostType
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HostType {
@@ -22,13 +28,14 @@ pub enum HostType {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct UrlComponents {
     pub protocol_end: u32,
-    pub username_end: u32,
-    pub host_start: u32,
-    pub host_end: u32,
-    pub port: Option<u16>,
-    pub pathname_start: u32,
-    pub search_start: Option<u32>,
-    pub hash_start: Option<u32>,
+    pub username_end: u32,   // End of username in buffer
+    pub host_start: u32,     // Start of host in buffer (after username/password)
+    pub host_end: u32,       // End of host in buffer (before port, path)
+    // pub port: Option<u16>, // Removed, replaced by port_value.
+    pub port_value: Option<u16>, // The actual parsed port number
+    pub pathname_start: u32,   // Start of path in buffer
+    pub search_start: Option<u32>, // Start of search string (query) in buffer, after '?'
+    pub hash_start: Option<u32>,   // Start of fragment in buffer, after '#'
 }
 
 // Define public trait UrlBase
@@ -48,7 +55,8 @@ pub trait UrlBase {
     fn username_end(&self) -> u32;
     fn host_start(&self) -> u32;
     fn host_end(&self) -> u32;
-    fn port(&self) -> Option<u16>;
+    // UrlBase::port() should now reflect the port_value from UrlComponents
+    fn port(&self) -> Option<u16>; 
     fn pathname_start(&self) -> u32;
     fn search_start(&self) -> Option<u32>;
     fn hash_start(&self) -> Option<u32>;
