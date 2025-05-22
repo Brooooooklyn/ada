@@ -14,6 +14,15 @@ impl SchemeType {
     pub fn is_special(&self) -> bool {
         matches!(self, Self::Http | Self::Https | Self::File | Self::Ftp | Self::Ws | Self::Wss)
     }
+
+    pub fn default_port(&self) -> Option<u16> {
+        match self {
+            SchemeType::Http | SchemeType::Ws => Some(80),
+            SchemeType::Https | SchemeType::Wss => Some(443),
+            SchemeType::Ftp => Some(21),
+            _ => None,
+        }
+    }
 }
 
 // Define public enum HostType

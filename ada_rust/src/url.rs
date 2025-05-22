@@ -160,6 +160,46 @@ impl AdaUrl {
         self.hash = input.map(|s| s.to_string());
         Ok(())
     }
+
+    // Revised get_origin for clarity and correctness:
+    pub fn get_origin(&self) -> String {
+        if !self.is_valid {
+            return "null".to_string();
+        }
+
+        match self.scheme_type {
+            super::SchemeType::File => {
+                "null".to_string()
+            }
+            super::SchemeType::Http |
+            super::SchemeType::Https |
+            super::SchemeType::Ftp |
+            super::SchemeType::Ws |
+            super::SchemeType::Wss => {
+                let host_val = match &self.host {
+                    Some(h) if !h.is_empty() => h.as_str(),
+                    _ => return "null".to_string(), // Opaque origin if no host
+                };
+
+                // TODO: Host should be ASCII lowercase if it's a domain.
+                // IDNA processing would also happen here in a full implementation.
+                // For now, use as is.
+
+                let mut origin_str = format!("{}://{}", self.protocol, host_val);
+
+                if let Some(p) = self.port {
+                    if Some(p) != self.scheme_type.default_port() { // default_port() is on SchemeType
+                        origin_str.push_str(&format!(":{}", p));
+                    }
+                }
+                origin_str
+            }
+            _ => {
+                // For other schemes, including blob, or if is_valid was false initially.
+                "null".to_string()
+            }
+        }
+    }
 }
 
 impl UrlBase for AdaUrl {
