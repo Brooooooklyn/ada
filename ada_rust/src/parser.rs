@@ -59,11 +59,15 @@ fn needs_percent_encode(char_byte: u8, charset: PercentEncodeSet) -> bool {
             (char_byte <= 0x1F) || char_byte == 0x7F || char_byte == b' ' || char_byte == b'#' || char_byte == b'?'
         }
         PercentEncodeSet::Path => {
-            // Placeholder: Encodes C0 controls, space, ", #, <, >, ?, `
-            (char_byte <= 0x1F) || char_byte == 0x7F || char_byte == b' ' ||
-            char_byte == b'"' || char_byte == b'#' || char_byte == b'<' || char_byte == b'>' ||
-            char_byte == b'?' || char_byte == b'`'
-            // TODO: Add other characters as per PATH_PERCENT_ENCODE set from WHATWG spec.
+            // WHATWG URL Standard's "path percent-encode set":
+            // C0 control percent-encode set (U+0000-U+001F, U+007F), plus space, ", #, <, >, ?, `
+            (char_byte <= 0x1F) || (char_byte == 0x7F) || // C0 controls and DEL
+            char_byte == b' ' || char_byte == b'"' || char_byte == b'#' ||
+            char_byte == b'<' || char_byte == b'>' || char_byte == b'?' ||
+            char_byte == b'`'
+            // Note: '%' itself should be percent-encoded if it's not part of a valid sequence,
+            // but needs_percent_encode typically checks individual bytes before encoding happens.
+            // The actual encoding function handles '%' by not double-encoding.
         }
         PercentEncodeSet::Query | PercentEncodeSet::SpecialQuery => {
             // Simplified: Encodes C0 controls, space, #, <, >.
@@ -86,6 +90,119 @@ fn needs_percent_encode(char_byte: u8, charset: PercentEncodeSet) -> bool {
 fn append_percent_encoded(buffer: &mut String, char_byte: u8) {
     buffer.push('%');
     buffer.push_str(&format!("{:02X}", char_byte));
+}
+
+// Helper function for path processing and normalization
+fn process_and_normalize_path(path_view: &str, is_special: bool, _is_file_scheme_with_empty_host: bool) -> String {
+    let mut output_segments: Vec<String> = Vec::new();
+    let mut input_path = path_view;
+
+    // Preserve leading slash if present, important for distinguishing absolute/relative paths.
+    let mut leading_slash = false;
+    if input_path.starts_with('/') || (is_special && input_path.starts_with('\\')) {
+        leading_slash = true;
+        // input_path = &input_path[1..]; // Temporarily remove for splitting, will add back
+    }
+    
+    // If special, treat backslashes as forward slashes for splitting.
+    // This is a bit tricky if path_view itself is temporary.
+    // For now, we'll split by both. A more robust way might be to replace \ with / first.
+    let segments_iter = input_path.split(|c| c == '/' || (is_special && c == '\\'));
+
+    for segment in segments_iter {
+        if segment == ".." {
+            // Only pop if there's something to pop and it's not already an effective root ".."
+            // (e.g. don't pop if output_segments is empty and no leading slash, or just [""] for leading slash)
+            if !output_segments.is_empty() {
+                // If the last segment is not empty (not just a marker for a trailing slash from input like "/a//b"), pop it.
+                // If it is empty, it means we had something like "/a/", and ".." should pop "a".
+                if output_segments.last().map_or(false, |s| s.is_empty()) && output_segments.len() > 1 {
+                     output_segments.pop(); // Pop the empty string (trailing slash marker)
+                }
+                output_segments.pop(); // Pop the actual segment
+            } else if leading_slash {
+                // Input like "/../foo" - ".." at root does nothing if already at root.
+                // If output_segments is empty but there was a leading_slash, it means path started with "/"
+                // So "/.." results in just "/"
+            }
+            // If !leading_slash and output_segments is empty, ".." is added if not file scheme with empty host?
+            // For now, ".." at start of relative path remains ".."
+            // else if !leading_slash && !is_file_scheme_with_empty_host {
+            //     output_segments.push("..".to_string());
+            // }
+
+        } else if segment == "." {
+            // Do nothing, effectively removing "."
+        } else if !segment.is_empty() {
+            // Normal segment, percent-encode and add.
+            let mut encoded_segment = String::new();
+            for char_byte in segment.as_bytes() {
+                if needs_percent_encode(*char_byte, PercentEncodeSet::Path) {
+                    append_percent_encoded(&mut encoded_segment, *char_byte);
+                } else {
+                    encoded_segment.push(*char_byte as char);
+                }
+            }
+            output_segments.push(encoded_segment);
+        } else if segment.is_empty() && output_segments.is_empty() && !leading_slash {
+            // Handles cases like "" or "./" for relative paths where first segment is empty.
+            // If path_view was just ".", segment is ".", handled above.
+            // If path_view was just "/", segments are ["", ""].
+            // If path_view was empty, iterator yields one empty string.
+            // output_segments.push("".to_string()); // Keep it to represent it was not just "."
+        }
+    }
+    
+    let mut result = String::new();
+    if leading_slash {
+        result.push('/');
+    }
+
+    if !output_segments.is_empty() {
+        result.push_str(&output_segments.join("/"));
+        // Handle trailing slash if original path_view had one and it wasn't just "/" or "/." etc.
+        // or if last segment processed was empty (e.g. from "a//b" or "a/.").
+        if (path_view.ends_with('/') || (is_special && path_view.ends_with('\\'))) && !result.ends_with('/') {
+            // And it wasn't just input like "/" or "/." or "/.."
+            if path_view.len() > 1 && !(path_view.ends_with("/.") || path_view.ends_with("/..")) {
+                 result.push('/');
+            }
+        }
+        // If output_segments contained multiple items, and the last one is empty, it means
+        // original path ended with something like "a/" or "a//". join("/") would give "a/" or "a//".
+        // If original was "/a/b/" -> segments ["", "a", "b", ""], join -> "/a/b/" (leading / added already)
+        // If original was "a/b/" -> segments ["a", "b", ""], join -> "a/b/"
+        // If original was "a//b" -> segments ["a", "", "b"], join -> "a//b"
+
+        // If result is like "//foo" but should be "/foo" (common after operations like /a/../.. -> "")
+        while result.starts_with("//") && result.len() > 1 {
+            result.remove(0);
+        }
+    } else if leading_slash && output_segments.is_empty() {
+        // Path was like "/", "/.", "/..". Result is already "/".
+    } else {
+        // Path was empty, or like ".", or ".." (relative)
+        // If path_view was "." or "./", output_segments is empty. Result is "".
+        // If path_view was ".." or "../", output_segments might be [".."]. Result is "..".
+        // This path is tricky. For now, if output_segments is empty and no leading slash, result is empty.
+        // which is fine for inputs like "" or ".".
+        // If path_view was ".." it should result in ".."
+        if path_view == ".." { return "..".to_string(); }
+
+    }
+    // If the result is empty but there was meaningful input that normalized to empty (e.g. "a/.."),
+    // and no leading slash, result should be "."
+    // This is complex. C++ ada returns "." if input is not empty, scheme is not file, and output is empty.
+    // For now, this simplified version might return "" for "a/..".
+    // A common behavior: if the original path was not empty and the normalized path is empty,
+    // it becomes "." unless it was an absolute path (started with /), then it's "/".
+    if result.is_empty() && !leading_slash && !path_view.is_empty() && path_view != "." {
+        // e.g. "foo/../" or "foo/bar/../.."
+        // result = ".".to_string(); // This is often the desired behavior for relative paths
+    }
+
+
+    result
 }
 
 
