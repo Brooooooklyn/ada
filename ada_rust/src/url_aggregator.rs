@@ -191,6 +191,212 @@ impl UrlAggregator {
         Ok(())
     }
 
+    // Helper to check for authority presence
+    fn has_authority(&self) -> bool {
+        // A simple check: if host_start is beyond where "scheme://" would end, authority is likely present.
+        // Or if host_end is meaningfully set beyond protocol_end.
+        // This doesn't strictly mean a host was parsed, could be just userinfo.
+        // A more robust check might look at specific component values or if buffer contains "//" after scheme.
+        if self.components.host_start > 0 && self.components.host_start > self.components.protocol_end {
+            // Check if there's content between protocol_end and host_start that looks like "//"
+            let after_scheme_offset = self.components.protocol_end as usize;
+            if self.buffer.len() >= after_scheme_offset + 2 && self.buffer[after_scheme_offset..].starts_with("//") {
+                return true;
+            }
+        }
+        // Fallback: if host_end is significantly larger than protocol_end, implies authority.
+        // This is less precise as host_end includes port.
+        self.components.host_end > self.components.protocol_end && self.buffer.contains("://")
+    }
+
+
+    pub fn clear_pathname(&mut self) {
+        let path_start_idx = self.components.pathname_start as usize;
+
+        // Determine the start of the query or fragment, whichever comes first.
+        // This marks the end of the actual path content in the buffer.
+        let path_content_end_idx = self.components.search_start.map(|s| s as usize)
+            .unwrap_or_else(|| self.components.hash_start.map(|h| h as usize)
+            .unwrap_or(self.buffer.len()));
+
+        if path_start_idx > self.buffer.len() || path_content_end_idx > self.buffer.len() || path_start_idx > path_content_end_idx {
+            // Path is already empty or component values are inconsistent.
+            // Ensure a consistent state for an empty path.
+            // If path_start_idx is valid, truncate everything after it.
+            if path_start_idx <= self.buffer.len() {
+                self.buffer.truncate(path_start_idx);
+            }
+            // Path is empty, so no search or hash can follow directly from path.
+            self.components.pathname_start = self.buffer.len() as u32; // Path is empty, starts and ends here.
+            self.components.search_start = None;
+            self.components.hash_start = None;
+            self.has_opaque_path = false;
+            return;
+        }
+
+        // Store the query and fragment part if it exists after the path content.
+        let mut query_fragment_suffix = String::new();
+        if path_content_end_idx < self.buffer.len() {
+            query_fragment_suffix.push_str(&self.buffer[path_content_end_idx..]);
+        }
+
+        // Truncate the buffer to remove the old path content.
+        self.buffer.truncate(path_start_idx);
+
+        // The (now empty) path ends where it started.
+        // Then, append the query and fragment suffix.
+        let new_pathname_end_idx = self.buffer.len() as u32; // Should be same as pathname_start
+
+        if !query_fragment_suffix.is_empty() {
+            self.buffer.push_str(&query_fragment_suffix);
+            // Update search_start and hash_start based on the suffix.
+            if query_fragment_suffix.starts_with('?') {
+                self.components.search_start = Some(new_pathname_end_idx);
+                if let Some(hash_offset_in_suffix) = query_fragment_suffix.find('#') {
+                    self.components.hash_start = Some(new_pathname_end_idx + hash_offset_in_suffix as u32);
+                } else {
+                    self.components.hash_start = None;
+                }
+            } else if query_fragment_suffix.starts_with('#') {
+                self.components.search_start = None; // No query if suffix starts with #
+                self.components.hash_start = Some(new_pathname_end_idx);
+            } else {
+                // This case should ideally not happen if path_content_end_idx was correct.
+                // It means there was content after path that wasn't query or fragment.
+                // Or, query/fragment didn't start with '?' or '#'.
+                // For safety, nullify them if the suffix doesn't match expected prefixes.
+                self.components.search_start = None;
+                self.components.hash_start = None;
+            }
+        } else {
+            // No query or fragment suffix was present after the path.
+            self.components.search_start = None;
+            self.components.hash_start = None;
+        }
+        
+        // After clearing, pathname_start should point to the new end of the (empty) path.
+        // This matches C++ ada's components.pathname_start = buffer.length();
+        self.components.pathname_start = new_pathname_end_idx;
+
+        self.has_opaque_path = false;
+
+        // If authority is present and path is now empty (before query/fragment), ensure path is "/"
+        if self.has_authority() {
+            let current_path_end = self.components.search_start.map(|s| s as usize)
+                .unwrap_or_else(|| self.components.hash_start.map(|h| h as usize)
+                .unwrap_or(self.buffer.len()));
+            
+            let path_is_empty_after_clear = self.components.pathname_start as usize == current_path_end;
+
+            if path_is_empty_after_clear {
+                // Path is empty, and authority exists. Insert '/'.
+                // The suffix (query/fragment) is already stored in query_fragment_suffix.
+                // We need to insert '/' into the buffer at pathname_start.
+                
+                let original_suffix_len = query_fragment_suffix.len();
+                if original_suffix_len > 0 { // Temporarily remove suffix to insert '/'
+                    self.buffer.truncate(self.components.pathname_start as usize);
+                }
+
+                self.buffer.push('/');
+                
+                // Re-append suffix and update component starts
+                if original_suffix_len > 0 {
+                    let slash_pos = self.buffer.len() as u32 -1; // position of the just added slash
+                    self.buffer.push_str(&query_fragment_suffix);
+                    
+                    if query_fragment_suffix.starts_with('?') {
+                        self.components.search_start = Some(slash_pos + 1);
+                        if let Some(hash_offset_in_suffix) = query_fragment_suffix.find('#') {
+                            self.components.hash_start = Some(slash_pos + 1 + hash_offset_in_suffix as u32);
+                        } else {
+                            self.components.hash_start = None;
+                        }
+                    } else if query_fragment_suffix.starts_with('#') {
+                        self.components.search_start = None;
+                        self.components.hash_start = Some(slash_pos + 1);
+                    }
+                }
+                // Pathname now starts at the new slash, or if no suffix, pathname_start is already correct.
+                // If suffix was re-added, pathname_start does not change from its original value (start of where path was).
+                // The path itself is now just "/".
+            }
+        }
+    }
+
+    pub fn clear_search(&mut self) {
+        if self.components.search_start.is_none() {
+            return; // No search component to clear
+        }
+
+        let search_start_idx = self.components.search_start.unwrap() as usize;
+
+        // Determine the start of the fragment, if it exists.
+        // This marks the end of the search content in the buffer.
+        let search_content_end_idx = self.components.hash_start.map(|h| h as usize)
+            .unwrap_or(self.buffer.len());
+
+        if search_start_idx > self.buffer.len() || search_content_end_idx > self.buffer.len() || search_start_idx > search_content_end_idx {
+            // Inconsistent state. For safety, just nullify search and hash if search_start_idx is problematic.
+            if search_start_idx <= self.buffer.len() { // If search_start_idx itself is valid, truncate there.
+                 self.buffer.truncate(search_start_idx);
+            }
+            self.components.search_start = None;
+            self.components.hash_start = None; // Clearing search might make hash position invalid if not handled.
+            return;
+        }
+
+        // Store the fragment part if it exists after the search content.
+        let mut fragment_suffix = String::new();
+        if search_content_end_idx < self.buffer.len() && self.components.hash_start.is_some() {
+            // Ensure we only copy if there actually is a hash component defined to start at/after search_content_end_idx
+            if self.components.hash_start.unwrap() as usize == search_content_end_idx {
+                 fragment_suffix.push_str(&self.buffer[search_content_end_idx..]);
+            } else {
+                // hash_start is not immediately after search, this is an inconsistent state
+                // or there's unexpected data between search and hash.
+                // For safety, we won't preserve anything after search_content_end_idx if it's not the defined hash_start
+            }
+        }
+
+
+        // Truncate the buffer to remove the old search content (and potentially fragment if not careful).
+        self.buffer.truncate(search_start_idx);
+
+        // The search is now cleared. `search_start` will be set to None.
+        // Then, append the fragment suffix.
+        let new_search_end_idx = self.buffer.len() as u32;
+
+        if !fragment_suffix.is_empty() && fragment_suffix.starts_with('#') {
+            self.buffer.push_str(&fragment_suffix);
+            self.components.hash_start = Some(new_search_end_idx);
+        } else {
+            // No fragment suffix was present or it didn't start with '#'.
+            self.components.hash_start = None;
+        }
+        
+        self.components.search_start = None;
+    }
+
+    pub fn clear_hash(&mut self) {
+        if self.components.hash_start.is_none() {
+            return; // No hash component to clear
+        }
+
+        let hash_start_idx = self.components.hash_start.unwrap() as usize;
+
+        if hash_start_idx > self.buffer.len() {
+            // Inconsistent state. For safety, just nullify hash_start.
+            self.components.hash_start = None;
+            return;
+        }
+
+        // Truncate the buffer to remove the old hash content.
+        self.buffer.truncate(hash_start_idx);
+        
+        self.components.hash_start = None;
+    }
+
     pub fn ensure_pathname_starts_with_slash_if_authority(&mut self) {
         // Check if authority is present. Authority ends at host_end (which includes port if present).
         // Protocol_end points after "scheme:".
@@ -250,6 +456,7 @@ impl UrlAggregator {
 
     // Getters
     pub fn href(&self) -> &str {
+        // For now, href is the raw buffer. Full reconstruction is complex.
         &self.buffer
     }
 
@@ -262,42 +469,124 @@ impl UrlAggregator {
     }
 
     pub fn username(&self) -> &str {
-        // Placeholder
+        // Placeholder - requires parsing buffer based on components
+        // For "scheme://user:pass@host", username is between "://" and first ":" before "@"
+        if self.components.host_start > self.components.protocol_end { // an authority exists
+            let authority_part_end = self.components.host_start as usize;
+            let authority_start = self.buffer[self.components.protocol_end as usize..].find("//").map_or(self.components.protocol_end as usize, |p| self.components.protocol_end as usize + p + 2);
+            
+            if authority_start < authority_part_end {
+                let authority_slice = &self.buffer[authority_start..authority_part_end];
+                if let Some(at_pos) = authority_slice.rfind('@') {
+                    let userinfo = &authority_slice[..at_pos];
+                    if let Some(colon_pos) = userinfo.find(':') {
+                        return &userinfo[..colon_pos];
+                    }
+                    return userinfo; // No password, all is username
+                }
+            }
+        }
         ""
     }
 
     pub fn password(&self) -> &str {
-        // Placeholder
+        // Placeholder - requires parsing buffer based on components
+        if self.components.host_start > self.components.protocol_end {
+            let authority_part_end = self.components.host_start as usize;
+            let authority_start = self.buffer[self.components.protocol_end as usize..].find("//").map_or(self.components.protocol_end as usize, |p| self.components.protocol_end as usize + p + 2);
+
+            if authority_start < authority_part_end {
+                let authority_slice = &self.buffer[authority_start..authority_part_end];
+                 if let Some(at_pos) = authority_slice.rfind('@') {
+                    let userinfo = &authority_slice[..at_pos];
+                    if let Some(colon_pos) = userinfo.find(':') {
+                        return &userinfo[colon_pos+1..];
+                    }
+                }
+            }
+        }
         ""
     }
 
     pub fn host(&self) -> &str {
-        // Placeholder
+        // Placeholder - requires parsing buffer based on components
+        // Host is between host_start and host_end, but host_end includes port.
+        if self.components.host_start < self.components.host_end {
+            let potential_host_port = &self.buffer[self.components.host_start as usize .. self.components.host_end as usize];
+            if self.components.port_value.is_some() {
+                if let Some(colon_pos) = potential_host_port.rfind(':') {
+                    // Check if stuff after colon is numeric only, to be more robust, but for now assume it's the port.
+                    return &potential_host_port[..colon_pos];
+                }
+            }
+            return potential_host_port;
+        }
         ""
     }
 
     pub fn hostname(&self) -> &str {
-        // Placeholder
-        ""
+        // Simplified: same as host for now.
+        self.host()
     }
 
     pub fn port(&self) -> &str {
-        // Placeholder
+        // Placeholder - returns the port part as a string slice from buffer
+        if self.components.port_value.is_some() && self.components.host_start < self.components.host_end {
+             let potential_host_port = &self.buffer[self.components.host_start as usize .. self.components.host_end as usize];
+             if let Some(colon_pos) = potential_host_port.rfind(':') {
+                 // Check if char after colon is a digit to be more sure
+                 if potential_host_port.as_bytes().get(colon_pos + 1).map_or(false, |b| b.is_ascii_digit()) {
+                    return &potential_host_port[colon_pos+1..];
+                 }
+             }
+        }
         ""
     }
 
     pub fn pathname(&self) -> &str {
-        // Placeholder
-        ""
+        let start = self.components.pathname_start as usize;
+        let end = self.components.search_start.map(|s| s as usize)
+            .unwrap_or_else(|| self.components.hash_start.map(|h| h as usize)
+            .unwrap_or(self.buffer.len()));
+        
+        if start <= end && end <= self.buffer.len() {
+            &self.buffer[start..end]
+        } else {
+            // If authority is present and path is empty, it should be "/"
+            let authority_present = self.components.host_end > self.components.protocol_end || self.buffer.contains("://");
+            if authority_present && start == end { // Path is empty
+                return "/"; // Synthesize "/"
+            }
+            ""
+        }
     }
 
     pub fn search(&self) -> &str {
-        // Placeholder
+        if let Some(start_idx_u32) = self.components.search_start {
+            let start = start_idx_u32 as usize;
+            // Search includes the '?'
+            // End is start of hash or end of buffer
+            let end = self.components.hash_start.map(|h| h as usize)
+                .unwrap_or(self.buffer.len());
+            if start < end && end <= self.buffer.len() && self.buffer.as_bytes().get(start) == Some(&b'?') {
+                 return &self.buffer[start..end];
+            } else if start == end && self.buffer.as_bytes().get(start-1) == Some(&b'?') { // only '?'
+                 return &self.buffer[start-1..end];
+            }
+        }
         ""
     }
 
     pub fn hash(&self) -> &str {
-        // Placeholder
+        if let Some(start_idx_u32) = self.components.hash_start {
+            let start = start_idx_u32 as usize;
+            // Hash includes the '#'
+            if start < self.buffer.len() && self.buffer.as_bytes().get(start) == Some(&b'#') {
+                return &self.buffer[start..];
+            } else if start == self.buffer.len() && self.buffer.as_bytes().get(start-1) == Some(&b'#') { // only '#'
+                return &self.buffer[start-1..];
+            }
+        }
         ""
     }
 

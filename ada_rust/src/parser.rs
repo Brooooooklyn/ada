@@ -47,7 +47,7 @@ pub enum PercentEncodeSet {
     C0Control,
     Query,
     SpecialQuery,
-    // Fragment can be added if needed, though often it has a very restricted set or is handled differently.
+    Fragment,
 }
 
 // Updated percent-encoding function
@@ -67,17 +67,18 @@ fn needs_percent_encode(char_byte: u8, charset: PercentEncodeSet) -> bool {
         }
         PercentEncodeSet::Query | PercentEncodeSet::SpecialQuery => {
             // Simplified: Encodes C0 controls, space, #, <, >.
-            // Query encoding in spec is complex: application/x-www-form-urlencoded (space to '+') vs. general query.
-            // WHATWG URL spec's "query state" percent-encode set includes C0 controls, space, #, <, >.
-            // SpecialQuery might be slightly more permissive for ' / ? ; = &' but for now, same as Query.
-            // It should NOT encode '+' if space is being encoded as '+'.
-            // If space is %20, then '+' can be encoded if it's not meant as a delimiter.
-            // For now, let's assume space is %20, and we are not encoding typical query delimiters like '&', '=', '+'.
             (char_byte <= 0x1F) || char_byte == 0x7F || // C0 controls and DEL
             char_byte == b' ' || char_byte == b'#' || char_byte == b'<' || char_byte == b'>' || char_byte == b'"'
-            // Does NOT encode: & = + ; / ? (unless part of a very specific set for special URLs)
-            // The task asks for Query to encode C0, space, ", #, <, >. This is implemented.
-            // SpecialQuery is same for now.
+        }
+        PercentEncodeSet::Fragment => {
+            // Fragment percent-encode set: C0 controls, space, ", <, >, `
+            // U+0000 to U+001F, U+007F
+            (char_byte <= 0x1F) || char_byte == 0x7F ||
+            char_byte == b' ' || char_byte == b'"' || char_byte == b'<' ||
+            char_byte == b'>' || char_byte == b'`'
+            // Note: '#' is the fragment delimiter itself, so it wouldn't be part of fragment content
+            // unless it was percent-encoded from an earlier stage or part of the final_fragment_to_append.
+            // '?' also typically not encoded in fragments unless desired.
         }
     }
 }
@@ -95,18 +96,25 @@ pub fn parse(input: &str, base_url: Option<&UrlAggregator>) -> Result<UrlAggrega
 
 fn parse_internal(input: &str, _base_url: Option<&UrlAggregator>) -> Result<UrlAggregator, ParseError> {
     let mut state = State::SchemeStart;
-    let mut url = UrlAggregator::default(); // Requires Default trait for UrlAggregator
+    let mut url = UrlAggregator::default();
 
-    // Pre-processing
-    let mut input_data = input;
-    // TODO: handle tabs/newlines
-    // TODO: handle C0 whitespace trim
-    let _fragment: Option<&str> = None; // TODO: implement prune_hash
+    let mut input_for_main_parser = input;
+    let mut final_fragment_to_append: Option<&str> = None;
 
+    if let Some(hash_pos) = input_for_main_parser.find('#') {
+        final_fragment_to_append = Some(&input_for_main_parser[hash_pos + 1..]);
+        input_for_main_parser = &input_for_main_parser[..hash_pos];
+    }
+
+    // TODO: Perform tab/newline removal and C0 whitespace trim on `input_for_main_parser`.
+    // For now, assume these are done.
+    let input_data = input_for_main_parser; // Use this for the main parsing loop
+    let input_size = input_data.len();      // Length of the string without the final fragment
     let mut input_position = 0;
-    let input_size = input_data.len();
 
-    while input_position <= input_size { // Condition might need adjustment for Rust iterators vs C++ pointer logic
+    // `_fragment` variable from before is replaced by `final_fragment_to_append`
+
+    while input_position <= input_size { 
         match state {
             State::SchemeStart => {
                 if input_position < input_size && input_data.as_bytes()[input_position].is_ascii_alphabetic() {
@@ -486,6 +494,29 @@ fn parse_internal(input: &str, _base_url: Option<&UrlAggregator>) -> Result<UrlA
                 // If loop finished by EOF, main loop terminates.
                 continue;
             }
+            State::Fragment => {
+                // Assumes input_position is at the char *after* '#' (if # was in input_data)
+                // or this state might be entered directly if final_fragment_to_append is processed later.
+                // For now, this state consumes the rest of `input_data` if a '#' was found mid-string.
+                // The final_fragment_to_append logic at the end of parse_internal handles the main fragment.
+
+                // If this state is reached, url.buffer already contains '#' and url.components.hash_start is set.
+                
+                while input_position < input_size { // input_size is for input_data (pre-pruned fragment)
+                    let char_byte = input_data.as_bytes()[input_position];
+                    // All characters in the fragment part of input_data are processed here.
+                    if needs_percent_encode(char_byte, PercentEncodeSet::Fragment) {
+                        append_percent_encoded(&mut url.buffer, char_byte);
+                    } else {
+                        url.buffer.push(char_byte as char);
+                    }
+                    input_position += 1;
+                }
+
+                // Consumed all of input_data after the '#', if any.
+                input_position = input_size + 1; // Terminate main parsing loop.
+                continue;
+            }
         }
 
         // If a state did not `continue`, `return`, or explicitly set `input_position` to `input_size + 1` to break,
@@ -499,9 +530,58 @@ fn parse_internal(input: &str, _base_url: Option<&UrlAggregator>) -> Result<UrlA
         }
     }
 
-    // TODO: handle fragment (usually pre-parsed and appended at the end)
     // TODO: Final validation and setting url.is_valid properly.
-    url.is_valid = true; // Placeholder
+    
+    if let Some(frag_data) = final_fragment_to_append {
+        if url.components.hash_start.is_none() {
+             url.components.hash_start = Some(url.buffer.len() as u32);
+             url.buffer.push('#');
+        }
+        // If hash_start is Some, '#' is already in buffer. Append frag_data.
+        // The State::Fragment might have already processed some part if '#' was in input_data.
+        // This logic appends the *original* fragment string that was pruned.
+        // If State::Fragment ran, it means input_data had a '#'. The buffer will be like "base#fragment_from_input_data".
+        // We are now appending the true final_fragment_to_append.
+        // This means if input was "http://a.com#mid#end",
+        // input_data = "http://a.com", final_fragment_to_append = "mid#end"
+        // State::Fragment won't run from input_data.
+        // url.buffer becomes "http://a.com#", then "mid#end" is appended (encoded).
+        // If input was "http://a.com#mid?key=val#end",
+        // input_data = "http://a.com#mid?key=val", final_fragment_to_append = "end"
+        // State::Fragment will process "mid?key=val" from input_data.
+        // url.buffer becomes "http://a.com#mid?key=val" (encoded).
+        // Then, "end" is appended here. This seems to double-process or misinterpret.
+        
+        // Correct logic: State::Fragment processes characters *after* a '#' found in input_for_main_parser.
+        // The final_fragment_to_append is *only* from the original input's *first* '#'.
+        // So, if State::Fragment ran, it means input_for_main_parser itself contained a '#'.
+        // This is usually an error or means the fragment was not correctly pruned.
+        // For WHATWG compliance, the first '#' delimits the fragment.
+        // Our pruning logic already ensures final_fragment_to_append is from the *first* '#'.
+        // input_for_main_parser should NOT contain any '#'. If it does, those should be errors or percent-encoded.
+        // So, State::Fragment should ideally not run if pruning is correct.
+        // Let's assume for now State::Fragment is for cases where # is not correctly handled by pruning (e.g. future features).
+        // The primary way fragment is added is here:
+        
+        // If hash_start is set, it means '#' is in buffer. We just append frag_data.
+        // If hash_start is NOT set, it means no '#' was encountered in the main parsing logic,
+        // so we add '#' and then frag_data.
 
+        for &char_byte in frag_data.as_bytes() {
+            if needs_percent_encode(char_byte, PercentEncodeSet::Fragment) {
+                // The append_percent_encoded function in the prompt is missing the charset argument.
+                // Assuming it should be: append_percent_encoded(&mut url.buffer, char_byte);
+                // Or if it took charset: append_percent_encoded(&mut url.buffer, char_byte, PercentEncodeSet::Fragment);
+                // For now, assuming the simpler version or that it internally knows the fragment rules.
+                // The provided function `append_percent_encoded` does not take a charset.
+                // Let's assume it's generic or we use the one from the file.
+                append_percent_encoded(&mut url.buffer, char_byte);
+            } else {
+                url.buffer.push(char_byte as char);
+            }
+        }
+    }
+    
+    url.is_valid = true; // Placeholder
     Ok(url)
 }
